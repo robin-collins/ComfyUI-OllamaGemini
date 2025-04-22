@@ -626,27 +626,98 @@ class ClaudeAPI:
             return (f"API Error: {str(e)}",)
 
 class GeminiAPI:
+    _gemini_model_list = None  # Class variable to store the model list
+    _gemini_models_fetched = False # Flag to ensure fetching only happens once
+
     def __init__(self):
         self.gemini_api_key = get_gemini_api_key()
         if self.gemini_api_key:
-            genai.configure(api_key=self.gemini_api_key, transport='rest')
+            try:
+                genai.configure(api_key=self.gemini_api_key, transport='rest')
+                print("Gemini API configured in __init__.")
+                # Fetch models only if they haven't been fetched before for this class
+                if not GeminiAPI._gemini_models_fetched:
+                    GeminiAPI._fetch_and_store_models()
+            except Exception as e:
+                 print(f"Error configuring Gemini API in __init__: {e}")
+
+    @classmethod
+    def get_gemini_models(cls):
+        """Fetches the list of available Gemini models from the API."""
+        api_key = get_gemini_api_key() # Fetch API key directly
+        if not api_key:
+            print("Error: Cannot fetch Gemini models without an API key.")
+            return []
+        try:
+            # Configure genai temporarily for this method call
+            genai.configure(api_key=api_key, transport='rest')
+            models = genai.list_models()
+            # Filter for models usable with generateContent
+            # Example filtering logic (adjust based on actual model properties)
+            usable_models = []
+            for m in models:
+                if 'generateContent' in m.supported_generation_methods:
+                    model_name = m.name.split('/')[-1] # Get last part after splitting by '/'
+                    if model_name.startswith('gemini-2'): # Filter for gemini-2*
+                         usable_models.append(model_name)
+
+            usable_models.sort() # Sort alphabetically
+
+            print(f"Fetched {len(usable_models)} usable Gemini models matching 'gemini-2*'.")
+            return usable_models
+        except Exception as e:
+            print(f"Error fetching Gemini models: {e}")
+            return []
+
+    @classmethod
+    def _fetch_and_store_models(cls):
+        """Fetches, processes, and stores the Gemini model list in a class variable."""
+        print("Attempting to fetch Gemini models...")
+        # Define the fallback list of models
+        fallback_models = [
+            # Gemini 2.5 Models
+            "gemini-2.5-pro-exp-03-25",
+            "gemini-2.5-flash-preview-04-17",
+            # Gemini 2.0 Models
+            "gemini-2.0-flash",
+            "gemini-2.0-flash-lite",
+            # Gemini 1.5 Models
+            "gemini-1.5-pro",
+            "gemini-1.5-flash",
+            "gemini-1.5-flash-8b"
+        ]
+
+        # Try to get the dynamic list
+        dynamic_models = cls.get_gemini_models()
+
+        # Use dynamic list if available, otherwise use fallback
+        cls._gemini_model_list = dynamic_models if dynamic_models else fallback_models
+        if not dynamic_models:
+            print("Warning: Failed to fetch dynamic Gemini models. Using fallback list.")
+        else:
+            print(f"Successfully stored {len(cls._gemini_model_list)} Gemini models.")
+
+        cls._gemini_models_fetched = True # Set flag after attempting fetch
+
 
     @classmethod
     def INPUT_TYPES(cls):
+        # Ensure models are fetched if they haven't been
+        if not cls._gemini_models_fetched or cls._gemini_model_list is None:
+            print("Models not fetched yet in INPUT_TYPES, attempting fetch...")
+            cls._fetch_and_store_models()
+
+        # Use the stored list (which could be the fallback)
+        gemini_model_list = cls._gemini_model_list if cls._gemini_model_list is not None else []
+        if not gemini_model_list:
+             print("Warning: Gemini model list is empty in INPUT_TYPES.")
+             # Provide a minimal fallback if even the static list failed somehow
+             gemini_model_list = ["gemini-1.5-flash"] # Minimal fallback
+
         return {
             "required": {
                 "prompt": ("STRING", {"default": "What is the meaning of life?", "multiline": True}),
-                "gemini_model": ([
-                    # Gemini 2.5 Models
-                    "gemini-2.5-pro-exp-03-25",
-                    # Gemini 2.0 Models
-                    "gemini-2.0-flash",
-                    "gemini-2.0-flash-lite",
-                    # Gemini 1.5 Models
-                    "gemini-1.5-pro",
-                    "gemini-1.5-flash",
-                    "gemini-1.5-flash-8b"
-                ],),
+                "gemini_model": (gemini_model_list,), # Use the determined list
                 "stream": ("BOOLEAN", {"default": False}),
                 "structure_output": ("BOOLEAN", {"default": False}),
                 "prompt_structure": ([
@@ -661,7 +732,6 @@ class GeminiAPI:
                     "raw_text",
                     "json"
                 ], {"default": "raw_text"}),
-
             },
             "optional": {
                 "image": ("IMAGE",),
@@ -709,55 +779,70 @@ class GeminiAPI:
             print(f"Sending request to Gemini API with model: {gemini_model}")
             try:
                 if stream:
+                    # Streaming safety feedback might need different handling
+                    # For now, keep the existing stream logic
                     response = model.generate_content(content, generation_config=generation_config, stream=True)
                     textoutput = "\n".join([chunk.text for chunk in response])
+                    print("Gemini API stream response received.") # Added log for stream
                 else:
-                    # Set safety settings to be more permissive
+                    # Non-streaming request with safety settings
                     safety_settings = [
                         {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_NONE"},
                         {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_NONE"},
                         {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_NONE"},
                         {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_NONE"}
                     ]
-
                     response = model.generate_content(
                         content,
                         generation_config=generation_config,
                         safety_settings=safety_settings
                     )
+                    print("Gemini API response received.")
 
-                    if not hasattr(response, 'text'):
-                        # Handle empty response
-                        if hasattr(response, 'prompt_feedback'):
-                            return (f"API Error: Content blocked - {response.prompt_feedback}",)
+                    textoutput = "" # Default to empty string
+
+                    # 1. Check prompt feedback for blocks
+                    if response.prompt_feedback and response.prompt_feedback.block_reason:
+                        print(f"Gemini Error: Prompt blocked.")
+                        print(f"  Reason: {response.prompt_feedback.block_reason}")
+                        print(f"  Safety Ratings: {response.prompt_feedback.safety_ratings}")
+                        return (textoutput,) # Return empty string
+
+                    # 2. Check candidates if prompt was not blocked
+                    if response.candidates:
+                        candidate = response.candidates[0]
+                        # 3. Check candidate finish reason and safety ratings for blocks
+                        if candidate.finish_reason == 'SAFETY':
+                            print(f"Gemini Error: Response blocked by safety filters.")
+                            print(f"  Finish Reason: {candidate.finish_reason}")
+                            print(f"  Safety Ratings: {candidate.safety_ratings}")
+                            return (textoutput,) # Return empty string
+
+                        # 4. Check for valid content if not blocked by safety
+                        if candidate.content and candidate.content.parts:
+                             try:
+                                 textoutput = "".join(part.text for part in candidate.content.parts)
+                                 print("Successfully extracted text from Gemini response.")
+                             except ValueError as e:
+                                 # Handle cases where parts might not contain text (e.g., function calls)
+                                 print(f"Gemini Warning: Could not extract text from parts. Content: {candidate.content}")
+                                 textoutput = "" # Keep empty if text extraction fails
                         else:
-                            return (f"API Error: Empty response from Gemini API",)
+                            # Handle cases with no content parts for other reasons
+                            print(f"Gemini Warning: No content parts found in the response.")
+                            print(f"  Finish Reason: {candidate.finish_reason}")
+                            # textoutput remains empty
+                    else:
+                        # Handle cases where there are no candidates
+                        print("Gemini Error: No candidates found in the response.")
+                        return (textoutput,) # Return empty string
 
-                    textoutput = response.text
             except Exception as e:
-                print(f"Error generating content: {str(e)}")
+                print(f"Error during Gemini content generation: {str(e)}")
                 return (f"API Error: {str(e)}",)
 
-            print("Gemini API response received successfully")
-
-            # If structured output was requested, verify it's valid JSON
-            if structure_output and textoutput.strip():
-                try:
-                    # Try to find JSON in the response
-                    json_start = textoutput.find('{')
-                    json_end = textoutput.rfind('}')
-                    if json_start >= 0 and json_end > json_start:
-                        json_text = textoutput[json_start:json_end+1]
-                        # Try to parse the JSON to verify it's valid
-                        json.loads(json_text)
-                        print("Received valid JSON response from Gemini")
-                    else:
-                        print("Warning: Could not find JSON in the response")
-                except json.JSONDecodeError:
-                    print("Warning: Received invalid JSON from Gemini, returning raw response")
-
-            # Process the output based on the selected format
-            if textoutput.strip():
+            # Process the output based on the selected format (only if textoutput is not empty)
+            if textoutput and textoutput.strip():
                 # Clean up the text output
                 clean_text = textoutput.strip()
 
